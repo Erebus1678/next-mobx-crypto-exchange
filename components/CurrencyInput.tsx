@@ -8,12 +8,9 @@ import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { styled } from '@mui/material/styles'
-import React, { useMemo, useCallback } from 'react'
-import { Control, FieldError, Path } from 'react-hook-form'
+import React, { useCallback, useMemo } from 'react'
 
 import { Coin } from '@/types/api'
-
-import DebouncedInput from './DebouncedInput'
 
 const AnimatedProgress = styled(CircularProgress)({
   animation: 'fadeInOut 1.5s infinite ease-in-out',
@@ -24,13 +21,11 @@ const AnimatedProgress = styled(CircularProgress)({
   },
 })
 
-interface CurrencyInputProps<T extends Record<string, string | number>> {
-  control: Control<T>
-  name: Path<T>
-  error?: FieldError
-
+interface CurrencyInputProps {
   label: string
-  amountValue?: string
+  amountValue: string
+  onAmountChange: (value: string) => void
+  amountError?: string | null
   selectedCurrency: Coin | null
   onCurrencyChange: (currency: Coin | null) => void
   readonly currencyOptions: readonly Coin[]
@@ -39,21 +34,27 @@ interface CurrencyInputProps<T extends Record<string, string | number>> {
   disabled?: boolean
 }
 
-function CurrencyInput<T extends Record<string, string | number>>({
-  control,
-  name,
-  error,
+function CurrencyInput({
   label,
-  // amountValue, // RHF handles the value via Controller
+  amountValue,
+  onAmountChange,
+  amountError,
   selectedCurrency,
   onCurrencyChange,
   currencyOptions,
   loadingOptions,
   loadingRate,
   disabled = false,
-}: CurrencyInputProps<T>) {
+}: CurrencyInputProps) {
+  const handleAmountChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      onAmountChange(event.target.value)
+    },
+    [onAmountChange]
+  )
+
   const handleAutocompleteChange = useCallback(
-    (event: React.SyntheticEvent, newValue: Coin | null) => {
+    (_event: React.SyntheticEvent, newValue: Coin | null) => {
       onCurrencyChange(newValue)
     },
     [onCurrencyChange]
@@ -100,25 +101,28 @@ function CurrencyInput<T extends Record<string, string | number>>({
 
   return (
     <Stack direction="row" spacing={1} alignItems="flex-start">
-      <DebouncedInput
-        name={name}
-        control={control}
+      <TextField
         label={label}
-        type="number"
+        value={amountValue}
+        onChange={handleAmountChange}
         variant="outlined"
         fullWidth
         disabled={disabled}
-        fieldError={error}
-        delay={300}
+        error={!!amountError}
+        helperText={amountError ?? ' '}
         slotProps={{
           input: {
             inputProps: {
-              min: 0,
-              step: 'any',
+              inputMode: 'decimal',
+              // Custom validation lives in the store; keep the field as text so
+              // malformed strings reach the validator instead of being silently
+              // dropped by the browser's number input.
+              autoComplete: 'off',
+              'aria-invalid': !!amountError,
             },
             endAdornment: loadingRate ? (
               <InputAdornment position="end">
-                <AnimatedProgress size={20} />
+                <AnimatedProgress size={20} aria-label="Calculating rate" />
               </InputAdornment>
             ) : null,
             sx: {
@@ -172,4 +176,4 @@ function CurrencyInput<T extends Record<string, string | number>>({
   )
 }
 
-export default React.memo(CurrencyInput) as typeof CurrencyInput
+export default React.memo(CurrencyInput)

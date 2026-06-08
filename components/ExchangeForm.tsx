@@ -1,6 +1,5 @@
 'use client'
 
-import { zodResolver } from '@hookform/resolvers/zod'
 import RefreshIcon from '@mui/icons-material/Refresh'
 import SwapHorizIcon from '@mui/icons-material/SwapHoriz'
 import Alert from '@mui/material/Alert'
@@ -11,11 +10,9 @@ import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { styled } from '@mui/material/styles'
 import { observer } from 'mobx-react-lite'
-import React, { useEffect, useMemo } from 'react'
-import { useForm, SubmitHandler } from 'react-hook-form'
-import * as z from 'zod'
+import React, { useCallback, useEffect, useState } from 'react'
 
-import { useStore } from '@/store/StoreProvider'
+import { createExchangeStore } from '@/store/ExchangeStore'
 
 import CurrencyInput from './CurrencyInput'
 
@@ -35,103 +32,28 @@ const AnimatedAlert = styled(Alert)({
   },
 })
 
-const exchangeFormSchema = z.object({
-  fromAmount: z.string().refine(
-    val => {
-      if (val === '') return true
-      const num = parseFloat(val)
-      return !isNaN(num) && num >= 0
-    },
-    { message: 'Must be a non-negative number' }
-  ),
-  toAmount: z.string().refine(
-    val => {
-      if (val === '') return true
-      const num = parseFloat(val)
-      return !isNaN(num) && num >= 0
-    },
-    { message: 'Must be a non-negative number' }
-  ),
-})
-
-type ExchangeFormValues = z.infer<typeof exchangeFormSchema>
-
 const ExchangeForm: React.FC = observer(() => {
-  const store = useStore()
+  // Store is scoped to this widget — created once, disposed on unmount.
+  const [store] = useState(() => createExchangeStore())
 
-  const {
-    control,
-    handleSubmit,
-    watch,
-    setValue,
-    formState: { errors },
-  } = useForm<ExchangeFormValues>({
-    resolver: zodResolver(exchangeFormSchema),
-    defaultValues: {
-      fromAmount: '',
-      toAmount: '',
-    },
-    mode: 'onChange',
-  })
-
-  const fromAmountValue = watch('fromAmount')
-  const toAmountValue = watch('toAmount')
-
-  const sortedCoins = useMemo(() => store.filteredCoins, [store.filteredCoins])
-
+  // The only effect: sync with the external API (load coins) and clean up.
   useEffect(() => {
     store.loadCoins()
+    return () => store.dispose()
   }, [store])
 
-  // Update MobX store when RHF values change
-  useEffect(() => {
-    const currentStoreAmount = store.fromAmount
-    if (fromAmountValue !== currentStoreAmount) {
-      store.setAmount(fromAmountValue, 'from')
-    }
-  }, [fromAmountValue, store])
+  const handleSwap = useCallback(() => {
+    store.swap()
+  }, [store])
 
-  useEffect(() => {
-    const currentStoreAmount = store.toAmount
-    if (toAmountValue !== currentStoreAmount) {
-      store.setAmount(toAmountValue, 'to')
-    }
-  }, [toAmountValue, store])
-
-  // Update RHF fields when MobX store changes (e.g., after calculation)
-  useEffect(() => {
-    if (store.fromAmount !== fromAmountValue) {
-      setValue('fromAmount', store.fromAmount, { shouldValidate: true, shouldDirty: true })
-    }
-  }, [store.fromAmount, setValue, fromAmountValue])
-
-  useEffect(() => {
-    if (store.toAmount !== toAmountValue) {
-      setValue('toAmount', store.toAmount, { shouldValidate: true, shouldDirty: true })
-    }
-  }, [store.toAmount, setValue, toAmountValue])
-
-  const handleSwap = useMemo(
-    () => () => {
-      store.swapCurrencies()
-    },
-    [store]
-  )
-
-  const handleFormSubmit: SubmitHandler<ExchangeFormValues> = data => {
-    console.log('Form submitted (optional):', data)
-  }
-
-  const handleRetryLoadCoins = () => {
+  const handleRetryLoadCoins = useCallback(() => {
     store.retryLoadCoins()
-  }
+  }, [store])
+
+  const isBusy = store.isLoadingRate
 
   return (
-    <Box
-      component="form"
-      onSubmit={handleSubmit(handleFormSubmit)}
-      sx={{ maxWidth: 600, margin: 'auto' }}
-    >
+    <Box component="form" noValidate sx={{ maxWidth: 600, margin: 'auto' }}>
       <Stack spacing={2}>
         {store.error && (
           <Stack spacing={1}>
@@ -164,16 +86,16 @@ const ExchangeForm: React.FC = observer(() => {
           </Stack>
         )}
 
-        <CurrencyInput<ExchangeFormValues>
-          control={control}
-          name="fromAmount"
+        <CurrencyInput
           label="From"
+          amountValue={store.fromAmount}
+          onAmountChange={store.setFromAmount}
+          amountError={store.fromAmountError}
           selectedCurrency={store.activeFromCurrency}
           onCurrencyChange={store.setFromCurrency}
-          currencyOptions={sortedCoins}
+          currencyOptions={store.filteredCoins}
           loadingOptions={store.isLoadingCoins}
-          loadingRate={store.isLoadingRateTo}
-          error={errors.fromAmount}
+          loadingRate={store.isLoadingFrom}
           disabled={!store.canUseExchangeForm}
         />
 
@@ -181,42 +103,38 @@ const ExchangeForm: React.FC = observer(() => {
           <IconButton
             aria-label="Swap currencies"
             onClick={handleSwap}
-            disabled={!store.canUseExchangeForm || store.isLoadingRateFrom || store.isLoadingRateTo}
+            disabled={!store.canUseExchangeForm || isBusy}
             color="primary"
           >
             <AnimatedSwapIcon />
           </IconButton>
         </Stack>
 
-        <CurrencyInput<ExchangeFormValues>
-          control={control}
-          name="toAmount"
+        <CurrencyInput
           label="To"
+          amountValue={store.toAmount}
+          onAmountChange={store.setToAmount}
+          amountError={store.toAmountError}
           selectedCurrency={store.activeToCurrency}
           onCurrencyChange={store.setToCurrency}
-          currencyOptions={sortedCoins}
+          currencyOptions={store.filteredCoins}
           loadingOptions={store.isLoadingCoins}
-          loadingRate={store.isLoadingRateFrom}
-          error={errors.toAmount}
+          loadingRate={store.isLoadingTo}
           disabled={!store.canUseExchangeForm}
         />
 
-        {store.formattedRate && !store.isLoadingRateFrom && !store.isLoadingRateTo && (
-          <Typography
-            variant="body2"
-            align="center"
-            sx={{
-              height: '1.5em',
-              opacity: 1,
-              transition: 'opacity 0.3s ease-in-out',
-            }}
-          >
-            {store.formattedRate}
-          </Typography>
-        )}
-        {(!store.formattedRate || store.isLoadingRateFrom || store.isLoadingRateTo) && (
-          <Box sx={{ height: '1.5em' }} />
-        )}
+        <Typography
+          variant="body2"
+          align="center"
+          aria-live="polite"
+          sx={{
+            minHeight: '1.5em',
+            opacity: store.rateInfo && !isBusy ? 1 : 0,
+            transition: 'opacity 0.3s ease-in-out',
+          }}
+        >
+          {store.rateInfo && !isBusy ? store.rateInfo : ' '}
+        </Typography>
       </Stack>
     </Box>
   )
