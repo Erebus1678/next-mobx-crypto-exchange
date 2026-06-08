@@ -1,49 +1,71 @@
-import { makeAutoObservable, runInAction, computed } from 'mobx'
-import { Coin, ApiError, ConversionPayload } from '@/types/api'
-import { fetchCoins, fetchConversion } from '@/api/client'
+import { makeAutoObservable, runInAction } from 'mobx'
+
+import { exchangeService, type ExchangeService } from '@/services/exchangeService'
+import type { Coin, ApiError } from '@/types/api'
+import { AMOUNT_ERROR_MESSAGE, MAX_DECIMALS, isValidAmountFormat, parseAmount } from '@/utils/amount'
 import { debounce } from '@/utils/debounce'
 
-const MIN_AMOUNT = 0
-const DEBOUNCE_DELAY = 300 // 300ms debounce delay
-const AUTO_RETRY_DELAY = 10000 // 10s auto retry delay
+const DEBOUNCE_DELAY = 300
+const AUTO_RETRY_DELAY = 10000
+const DEFAULT_FROM_AMOUNT = '1'
 
-class ExchangeStore {
+/** Which field the user last edited. The OTHER field is always the derived one. */
+type Field = 'from' | 'to'
+
+/** Format a computed numeric result for display, trimming float noise. */
+function formatAmount(value: number): string {
+  return Number(value.toFixed(MAX_DECIMALS)).toString()
+}
+
+/**
+ * Widget-local store for the currency converter.
+ *
+ * Source-of-truth model: `source` marks the field the user last edited; the
+ * other field is always *derived* from it. Every currency change and swap
+ * recomputes the derived field from the source amount — a previously computed
+ * output is never reused as input. Conversion/rate logic lives in the injected
+ * {@link ExchangeService}; this store only holds state and orchestrates it.
+ */
+export class ExchangeStore {
   coins: Coin[] = []
   fromCurrency: Coin | null = null
   toCurrency: Coin | null = null
-  fromAmount: string = ''
+  fromAmount: string = DEFAULT_FROM_AMOUNT
   toAmount: string = ''
   rateInfo: string | null = null
+  amountError: string | null = null
+  source: Field = 'from'
 
-  isLoadingCoins: boolean = false
-  isLoadingRateFrom: boolean = false
-  isLoadingRateTo: boolean = false
+  isLoadingCoins = false
+  isLoadingRate = false
   error: string | null = null
-  hasLoadedCoins: boolean = false
-  autoRetryTimeoutId: NodeJS.Timeout | null = null
+  hasLoadedCoins = false
 
-  private debouncedFetchRate: (
-    amount: number,
-    fromCoin: Coin,
-    toCoin: Coin,
-    initiatedBy: 'from' | 'to'
-  ) => void
+  private readonly service: ExchangeService
+  private readonly debouncedRecalculate: (() => void) & { cancel: () => void }
+  private autoRetryTimeoutId: ReturnType<typeof setTimeout> | null = null
+  /** Monotonic token used to ignore stale (out-of-order) conversion responses. */
+  private requestId = 0
 
-  constructor() {
-    makeAutoObservable(
+  constructor(service: ExchangeService = exchangeService) {
+    this.service = service
+    makeAutoObservable<
+      ExchangeStore,
+      'service' | 'debouncedRecalculate' | 'autoRetryTimeoutId' | 'requestId'
+    >(
       this,
       {
-        filteredCoins: computed,
-        activeFromCurrency: computed,
-        activeToCurrency: computed,
-        canUseExchangeForm: computed,
+        service: false,
+        debouncedRecalculate: false,
+        autoRetryTimeoutId: false,
+        requestId: false,
       },
       { autoBind: true }
     )
-
-    // Initialize the debounced version of _fetchRate
-    this.debouncedFetchRate = debounce(this._fetchRate.bind(this), DEBOUNCE_DELAY)
+    this.debouncedRecalculate = debounce(this.recalculate, DEBOUNCE_DELAY)
   }
+
+  // --- Computed ---
 
   get filteredCoins() {
     return this.coins.slice().sort((a, b) => a.name.localeCompare(b.name))
@@ -51,53 +73,70 @@ class ExchangeStore {
 
   get activeFromCurrency() {
     if (!this.fromCurrency) return null
-    return this.coins.find(c => c.id === this.fromCurrency?.id) || null
+    return this.coins.find(c => c.id === this.fromCurrency?.id) ?? null
   }
 
   get activeToCurrency() {
     if (!this.toCurrency) return null
-    return this.coins.find(c => c.id === this.toCurrency?.id) || null
-  }
-
-  get formattedRate() {
-    if (!this.rateInfo) return null
-    return this.rateInfo
+    return this.coins.find(c => c.id === this.toCurrency?.id) ?? null
   }
 
   get canUseExchangeForm() {
     return this.hasLoadedCoins && !this.isLoadingCoins && this.coins.length > 0
   }
 
-  // --- Actions ---
+  /** Spinner belongs on the field being computed (the non-source field). */
+  get isLoadingFrom() {
+    return this.isLoadingRate && this.source === 'to'
+  }
+
+  get isLoadingTo() {
+    return this.isLoadingRate && this.source === 'from'
+  }
+
+  get fromAmountError() {
+    return this.source === 'from' ? this.amountError : null
+  }
+
+  get toAmountError() {
+    return this.source === 'to' ? this.amountError : null
+  }
+
+  // --- Atomic state setters ---
+
+  setCoins(coins: Coin[]) {
+    this.coins = coins
+  }
+
+  setError(message: string | null) {
+    this.error = message
+  }
+
+  // --- Coin loading ---
 
   async loadCoins() {
-    // Clear any existing auto-retry timeout
-    if (this.autoRetryTimeoutId) {
-      clearTimeout(this.autoRetryTimeoutId)
-      this.autoRetryTimeoutId = null
-    }
-
+    this.clearAutoRetry()
     this.isLoadingCoins = true
     this.error = null
+
     try {
-      const fetchedCoins = await fetchCoins()
+      const coins = await this.service.loadCoins()
       runInAction(() => {
-        this.coins = fetchedCoins
+        this.coins = coins
         this.hasLoadedCoins = true
-
-        const btc = fetchedCoins.find(coin => coin.symbol.toLowerCase() === 'btc')
-        const usdt = fetchedCoins.find(coin => coin.symbol.toLowerCase() === 'usdt')
-
-        this.fromCurrency = btc || fetchedCoins[0]
-        this.toCurrency = usdt || (fetchedCoins.length > 1 ? fetchedCoins[1] : null)
+        this.fromCurrency = this.pickDefault(coins, 'btc') ?? coins[0] ?? null
+        this.toCurrency = this.pickDefault(coins, 'usdt') ?? (coins.length > 1 ? coins[1] : null)
+        this.source = 'from'
+        this.fromAmount = DEFAULT_FROM_AMOUNT
+        this.toAmount = ''
+        this.amountError = null
       })
+      this.recalculate()
     } catch (err) {
       runInAction(() => {
         this.error = (err as ApiError).message || 'Failed to load currencies'
         this.coins = []
         this.hasLoadedCoins = false
-
-        // Schedule auto-retry
         this.autoRetryTimeoutId = setTimeout(() => this.retryLoadCoins(), AUTO_RETRY_DELAY)
       })
     } finally {
@@ -111,156 +150,169 @@ class ExchangeStore {
     return this.loadCoins()
   }
 
+  // --- Currency actions ---
+
   setFromCurrency(currency: Coin | null) {
-    if (currency?.id === this.toCurrency?.id) {
-      this.swapCurrencies()
-    } else {
-      this.fromCurrency = currency
-      this.toAmount = ''
-      this.rateInfo = null
-      this.triggerConversion('from')
+    if (currency && currency.id === this.toCurrency?.id) {
+      this.swap()
+      return
     }
+    this.fromCurrency = currency
+    this.recalculateFromSource()
   }
 
   setToCurrency(currency: Coin | null) {
-    if (currency?.id === this.fromCurrency?.id) {
-      this.swapCurrencies()
-    } else {
-      this.toCurrency = currency
-      this.fromAmount = ''
-      this.rateInfo = null
-      this.triggerConversion('to')
+    if (currency && currency.id === this.fromCurrency?.id) {
+      this.swap()
+      return
     }
+    this.toCurrency = currency
+    this.recalculateFromSource()
   }
 
-  setAmount(amount: string, type: 'from' | 'to') {
-    this.error = null
-    const parsedAmount = parseFloat(amount)
-    const isValidInput = !isNaN(parsedAmount) && parsedAmount >= MIN_AMOUNT
-
-    if (type === 'from') {
-      this.fromAmount = amount
-      if (isValidInput && this.fromCurrency && this.toCurrency && parsedAmount > MIN_AMOUNT) {
-        this.toAmount = ''
-        this.rateInfo = null
-        this.isLoadingRateFrom = true
-        this.debouncedFetchRate(parsedAmount, this.fromCurrency, this.toCurrency, 'from')
-      } else {
-        this.toAmount = ''
-        this.rateInfo = null
-        this.isLoadingRateFrom = false
-      }
-    } else {
-      this.toAmount = amount
-      if (isValidInput && this.fromCurrency && this.toCurrency && parsedAmount > MIN_AMOUNT) {
-        this.fromAmount = ''
-        this.rateInfo = null
-        this.isLoadingRateTo = true
-        this.debouncedFetchRate(parsedAmount, this.fromCurrency, this.toCurrency, 'to')
-      } else {
-        this.fromAmount = ''
-        this.rateInfo = null
-        this.isLoadingRateTo = false
-      }
-    }
-  }
-
-  swapCurrencies() {
-    const tempCurrency = this.fromCurrency
+  /** Flip currencies, keep the user's entered source amount, recompute the rest. */
+  swap() {
+    const previousFrom = this.fromCurrency
     this.fromCurrency = this.toCurrency
-    this.toCurrency = tempCurrency
-
-    const tempAmount = this.fromAmount
-    this.fromAmount = this.toAmount
-    this.toAmount = tempAmount
-
-    this.rateInfo = null
-    this.error = null
-
-    this.triggerConversion('from')
+    this.toCurrency = previousFrom
+    this.recalculateFromSource()
   }
 
-  // --- Private Helpers ---
+  // --- Amount actions ---
 
-  private triggerConversion(changedField: 'from' | 'to') {
-    const amountStr = changedField === 'from' ? this.fromAmount : this.toAmount
-    const amount = parseFloat(amountStr)
-    if (!isNaN(amount) && amount > MIN_AMOUNT && this.fromCurrency && this.toCurrency) {
-      if (changedField === 'from') {
-        this.isLoadingRateFrom = true
-        this.debouncedFetchRate(amount, this.fromCurrency, this.toCurrency, 'from')
-      } else {
-        this.isLoadingRateTo = true
-        this.debouncedFetchRate(amount, this.toCurrency, this.fromCurrency, 'to')
-      }
+  setFromAmount(value: string) {
+    this.source = 'from'
+    this.fromAmount = value
+    this.handleAmountInput()
+  }
+
+  setToAmount(value: string) {
+    this.source = 'to'
+    this.toAmount = value
+    this.handleAmountInput()
+  }
+
+  // --- Lifecycle ---
+
+  dispose() {
+    this.clearAutoRetry()
+    this.cancelPendingRecalculate()
+    this.requestId++
+  }
+
+  // --- Private helpers ---
+
+  private pickDefault(coins: Coin[], symbol: string): Coin | null {
+    return coins.find(c => c.symbol.toLowerCase() === symbol) ?? null
+  }
+
+  private sourceAmount(): string {
+    return this.source === 'from' ? this.fromAmount : this.toAmount
+  }
+
+  /** Clear the derived (non-source) field and the rate display. */
+  private clearDerived() {
+    if (this.source === 'from') this.toAmount = ''
+    else this.fromAmount = ''
+    this.rateInfo = null
+  }
+
+  private clearAutoRetry() {
+    if (this.autoRetryTimeoutId) {
+      clearTimeout(this.autoRetryTimeoutId)
+      this.autoRetryTimeoutId = null
     }
   }
 
-  private async _fetchRate(
-    amount: number,
-    fromCoin: Coin,
-    toCoin: Coin,
-    initiatedBy: 'from' | 'to'
-  ) {
-    if (!fromCoin || !toCoin || amount <= MIN_AMOUNT) return
+  private cancelPendingRecalculate() {
+    this.debouncedRecalculate.cancel()
+  }
 
-    let payload: ConversionPayload
-    if (initiatedBy === 'from') {
-      payload = {
-        from: String(fromCoin.id),
-        to: String(toCoin.id),
-        fromAmount: amount,
-      }
-    } else {
-      payload = {
-        from: String(fromCoin.id),
-        to: String(toCoin.id),
-        toAmount: amount,
-      }
+  /** Validate the freshly typed value, then debounce a conversion if it's usable. */
+  private handleAmountInput() {
+    this.error = null
+    this.requestId++
+    this.cancelPendingRecalculate()
+    this.clearDerived()
+
+    const value = this.sourceAmount()
+
+    if (value === '') {
+      this.amountError = null
+      this.isLoadingRate = false
+      return
     }
 
+    if (parseAmount(value) === null) {
+      this.amountError = isValidAmountFormat(value) ? null : AMOUNT_ERROR_MESSAGE
+      this.isLoadingRate = false
+      return
+    }
+
+    this.amountError = null
+    this.isLoadingRate = true
+    this.debouncedRecalculate()
+  }
+
+  /** Recompute the derived field from the source amount after a currency change. */
+  private recalculateFromSource() {
     this.error = null
     this.rateInfo = null
+    this.requestId++
+    this.cancelPendingRecalculate()
+    this.clearDerived()
+
+    if (parseAmount(this.sourceAmount()) === null || !this.fromCurrency || !this.toCurrency) {
+      this.isLoadingRate = false
+      return
+    }
+
+    this.isLoadingRate = true
+    this.recalculate()
+  }
+
+  /** Perform the actual conversion for the current source field. */
+  private async recalculate() {
+    const field = this.source
+    const amount = parseAmount(this.sourceAmount())
+    const fromCoin = this.fromCurrency
+    const toCoin = this.toCurrency
+
+    if (amount === null || !fromCoin || !toCoin) {
+      this.clearDerived()
+      this.isLoadingRate = false
+      return
+    }
+
+    const requestId = ++this.requestId
+    this.isLoadingRate = true
+    this.error = null
 
     try {
-      const response = await fetchConversion(payload)
+      const { amount: result, rate } = await this.service.convert({
+        fromCoin,
+        toCoin,
+        amount,
+        direction: field,
+      })
       runInAction(() => {
-        const resultAmount = response.estimatedAmount
-        const rate = response.rate
-
-        if (initiatedBy === 'from') {
-          this.toAmount = String(resultAmount)
-          const inverseRate = 1 / rate
-          this.rateInfo = `1 ${toCoin.symbol} ≈ ${inverseRate.toFixed(6)} ${fromCoin.symbol}`
-        } else {
-          this.fromAmount = String(resultAmount)
-          const inverseRate = 1 / rate
-          this.rateInfo = `1 ${toCoin.symbol} ≈ ${inverseRate.toFixed(6)} ${fromCoin.symbol}`
-        }
-
-        // Reset loading state
-        if (initiatedBy === 'from') {
-          this.isLoadingRateFrom = false
-        } else {
-          this.isLoadingRateTo = false
-        }
+        if (requestId !== this.requestId) return
+        if (field === 'from') this.toAmount = formatAmount(result)
+        else this.fromAmount = formatAmount(result)
+        this.rateInfo = this.service.formatRate(fromCoin, toCoin, rate)
+        this.isLoadingRate = false
       })
     } catch (err) {
       runInAction(() => {
+        if (requestId !== this.requestId) return
         this.error = (err as ApiError).message || 'Failed to fetch conversion rate'
-        if (initiatedBy === 'from') this.toAmount = ''
-        else this.fromAmount = ''
-        this.rateInfo = null
-
-        // Reset loading state on error
-        if (initiatedBy === 'from') {
-          this.isLoadingRateFrom = false
-        } else {
-          this.isLoadingRateTo = false
-        }
+        this.clearDerived()
+        this.isLoadingRate = false
       })
     }
   }
 }
 
-export const exchangeStore = new ExchangeStore()
+export function createExchangeStore(service: ExchangeService = exchangeService): ExchangeStore {
+  return new ExchangeStore(service)
+}

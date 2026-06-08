@@ -6,7 +6,7 @@ A modern cryptocurrency exchange application built with Next.js, allowing users 
 
 - **Real-time Currency Conversion**: Convert between various cryptocurrencies with up-to-date exchange rates
 - **Search Functionality**: Easily find cryptocurrencies in the dropdown list
-- **Input Validation**: Form validation ensures only valid amounts can be entered
+- **Input Validation**: Strict positive-decimal validation rejects malformed input with clear messages
 - **Responsive Design**: Works on both desktop and mobile devices
 - **Loading States**: Visual feedback during API requests
 - **Error Handling**: User-friendly error messages
@@ -15,8 +15,8 @@ A modern cryptocurrency exchange application built with Next.js, allowing users 
 
 - **Frontend**: Next.js 15+, React 19
 - **UI Library**: Material UI 7.0
-- **State Management**: MobX
-- **Form Handling**: react-hook-form with Zod validation
+- **State Management**: MobX (widget-scoped store)
+- **Validation**: Zod schemas
 - **HTTP Client**: Axios
 - **Styling**: Emotion (CSS-in-JS)
 - **Type Safety**: TypeScript
@@ -62,8 +62,10 @@ A modern cryptocurrency exchange application built with Next.js, allowing users 
 ```
 ├── app/                      # Next.js app router components
 ├── components/               # Reusable UI components
+├── services/                 # Domain service layer (rate fetching / conversion)
 ├── api/                      # API client and type-safe API interactions
-├── store/                    # MobX stores
+├── store/                    # MobX store (widget-scoped, created via factory)
+├── utils/                    # Helpers (amount validation, debounce)
 ├── types/                    # TypeScript type definitions and schemas
 ├── public/                   # Static assets
 └── components/ThemeRegistry/ # Material UI theme configuration
@@ -71,9 +73,10 @@ A modern cryptocurrency exchange application built with Next.js, allowing users 
 
 ## Key Components
 
-- **ExchangeForm**: Main form component for currency exchange
+- **ExchangeForm**: Main form component for currency exchange; owns a widget-scoped store
 - **CurrencyInput**: Reusable input component with dropdown for currency selection
-- **ExchangeStore**: MobX store managing exchange state and API interactions
+- **ExchangeStore**: Widget-local MobX store (created via `createExchangeStore`) holding converter state with atomic actions
+- **exchangeService**: Service layer that owns rate fetching and conversion orchestration
 - **API Client**: Type-safe API client with Zod validation
 
 ## API Integration
